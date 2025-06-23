@@ -8,7 +8,7 @@ from replay_buffer import ReplayBuffer
 from model_pool import ModelPoolClient
 from env import MahjongGBEnv
 from feature import FeatureAgent
-from model import CNNModel
+from model import CNNLSTMModel
 
 class Actor(Process):
     
@@ -28,7 +28,11 @@ class Actor(Process):
         model_pool = ModelPoolClient(self.config['model_pool_name'])
         
         # create network model
-        model = CNNModel()
+        model = CNNLSTMModel(
+            lstm_hidden_size=self.config.get('lstm_hidden_size', 256),
+            lstm_layers=self.config.get('lstm_layers', 2),
+            dropout=self.config.get('dropout', 0.1)
+        )
         
         # load initial model
         version = model_pool.get_latest_model()
@@ -72,7 +76,7 @@ class Actor(Process):
                     state['action_mask'] = torch.tensor(state['action_mask'], dtype = torch.float).unsqueeze(0)
                     model.train(False) # Batch Norm inference mode
                     with torch.no_grad():
-                        logits, value = model(state)
+                        logits, value,_ = model(state)
                         action_dist = torch.distributions.Categorical(logits = logits)
                         action = action_dist.sample().item()
                         value = value.item()
