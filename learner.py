@@ -45,8 +45,9 @@ class Learner(Process):
         # training
         optimizer = torch.optim.Adam(
             model.parameters(), 
-            lr=self.config.get('lr', 1e-4),
-            weight_decay=self.config.get('weight_decay', 1e-5)
+            lr=self.config.get('lr', 5e-5),
+            weight_decay=self.config.get('weight_decay', 5e-4),
+            eps=1e-8
         )
         
         # 学习率调度器

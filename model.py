@@ -34,10 +34,14 @@ class CNNLSTMModel(nn.Module):
         
 
         self.feature_compressor = nn.Sequential(
-            nn.Linear(self.cnn_output_size, 512),
-            nn.ReLU(),
+            nn.Linear(self.cnn_output_size, 512, bias=False),  
+            nn.BatchNorm1d(512),  
+            nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(512, 256)
+            
+            nn.Linear(512, 256, bias=False),
+            nn.BatchNorm1d(256),  
+            nn.ReLU(inplace=True)
         )
         
 
@@ -60,20 +64,32 @@ class CNNLSTMModel(nn.Module):
         
         # 残差
         self.policy_head = nn.Sequential(
-            nn.Linear(lstm_hidden_size + 256, 512),  # 拼接当前特征
-            nn.ReLU(),
+            nn.Linear(lstm_hidden_size + 256, 512, bias=False),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 235)
+            
+            nn.Linear(512, 256, bias=False),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout * 0.5),  
+            
+            nn.Linear(256, 235)  
         )
         
 
         self.value_head = nn.Sequential(
-            nn.Linear(lstm_hidden_size + 256, 256),
-            nn.ReLU(),
+            nn.Linear(lstm_hidden_size + 256, 256, bias=False),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(256, 1)
+            
+            nn.Linear(256, 128, bias=False),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout * 0.5),
+            
+            nn.Linear(128, 1)  
         )
         
         # 权重初始化
@@ -84,12 +100,22 @@ class CNNLSTMModel(nn.Module):
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             elif isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                if m.bias is not None:
+                if hasattr(m, 'bias') and m.bias is not None:
+                    nn.init.xavier_normal_(m.weight)
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
+                else:
+                    # 对于没有bias的层（使用BatchNorm的层）
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LSTM):
+                # LSTM权重初始化
+                for name, param in m.named_parameters():
+                    if 'weight' in name:
+                        nn.init.orthogonal_(param)
+                    elif 'bias' in name:
+                        nn.init.constant_(param, 0)
     
     def forward(self, input_dict, hidden_state=None, return_attention=False):
         """

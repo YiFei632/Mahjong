@@ -311,8 +311,11 @@ class Actor(Process):
                         values = np.array(agent_data['value'], dtype = np.float32)
                         next_values = np.array(agent_data['value'][1:] + [0], dtype = np.float32)
                         
+                        
                         td_target = rewards + next_values * self.config['gamma']
                         td_delta = td_target - values
+                        
+
                         advs = []
                         adv = 0
                         for delta in td_delta[::-1]:
@@ -321,14 +324,23 @@ class Actor(Process):
                         advs.reverse()
                         advantages = np.array(advs, dtype = np.float32)
                         
-                        # send samples to replay_buffer (per agent)
+
+                        if len(advantages) > 1:
+                            adv_mean = np.mean(advantages)
+                            adv_std = np.std(advantages) + 1e-8  
+                            advantages = (advantages - adv_mean) / adv_std
+                        else:
+                            advantages = np.zeros_like(advantages)
+                        
+                        
+
                         self.replay_buffer.push({
                             'state': {
                                 'observation': obs,
                                 'action_mask': mask
                             },
                             'action': actions,
-                            'adv': advantages,
+                            'adv': advantages,  
                             'target': td_target
                         })
                     except Exception as e:

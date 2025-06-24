@@ -31,21 +31,21 @@ if __name__ == '__main__':
     print("-" * 50)
 
     config = {
-        'replay_buffer_size': 100000,  # 增加缓冲区大小
-        'replay_buffer_episode': 800,   # 增加episode缓冲
+        'replay_buffer_size': 30000, 
+        'replay_buffer_episode': 200, 
         'model_pool_size': 20,
         'model_pool_name': 'model-pool',  
         'num_actors': 24,
         'episodes_per_actor': 200000,   # 增加训练轮次
         'gamma': 0.99,                 # 稍微增加折扣因子
         'lambda': 0.95,
-        'min_sample': 500,             # 增加最小采样数
-        'batch_size': 512,             # 增加批次大小
-        'epochs': 5,
-        'clip': 0.2,
-        'lr': 3e-4,                    # 调整学习率
+        'min_sample': 200,             # 增加最小采样数
+        'batch_size': 256,             # 增加批次大小
+        'epochs': 2,
+        'clip': 0.1,
+        'lr': 5e-5,                    # 调整学习率
         'lr_decay': 0.99,              # 添加学习率衰减
-        'value_coeff': 0.5,            # 调整价值函数权重
+        'value_coeff': 1,            # 调整价值函数权重
         'entropy_coeff': 0.01,
         'device': 'cuda',
         
@@ -59,12 +59,15 @@ if __name__ == '__main__':
 
         'max_learner_iterations': 10000000,  # 增加最大迭代次数
         
+        'batch_norm': True,
+        'advantage_norm': True,
+        
         # LSTM相关配置
         'lstm_hidden_size': 256,
         'lstm_layers': 2,
         'dropout': 0.1,
-        'max_grad_norm': 1.0,
-        'weight_decay': 1e-5,        
+        'max_grad_norm': 0.4,
+        'weight_decay': 5e-4,        
     }
 
     print(f"Training configuration:")
