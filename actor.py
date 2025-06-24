@@ -2,6 +2,9 @@ from multiprocessing import Process
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
+import os
+import time
+from datetime import datetime
 
 from replay_buffer import ReplayBuffer
 from model_pool import ModelPoolClient
@@ -16,6 +19,7 @@ class Actor(Process):
         self.replay_buffer = replay_buffer
         self.config = config
         self.name = config.get('name', 'Actor-?')
+        self.episode_count = 0
         
     def run(self):
         # 初始化 TensorBoard Writer
@@ -55,6 +59,14 @@ class Actor(Process):
         
         reset_failures = 0
         max_reset_failures = 5
+        
+        # 统计指标
+        win_count = 0
+        total_reward = 0
+        episode_lengths = []
+        action_counts = {'Pass': 0, 'Play': 0, 'Chi': 0, 'Peng': 0, 'Gang': 0, 'Hu': 0}
+        
+        episode_progress_file = os.path.join(self.config['training_dir'], 'episode_progress.txt')
         
         for episode in range(self.config['episodes_per_actor']):
             try:
@@ -102,11 +114,15 @@ class Actor(Process):
                     },
                     'action' : [],
                     'reward' : [],
-                    'value' : []
+                    'value' : [],
+                    'action_probs': [],  # 添加动作概率记录
+                    'entropy': []        # 添加策略熵记录
                 } for agent_name in env.agent_names}
+                
                 done = False
                 step_count = 0
                 max_steps = 500  # 限制最大步数，防止无限循环
+                episode_action_counts = {'Pass': 0, 'Play': 0, 'Chi': 0, 'Peng': 0, 'Gang': 0, 'Hu': 0}
                 
                 while not done and step_count < max_steps:
                     step_count += 1
@@ -127,14 +143,36 @@ class Actor(Process):
                         state['action_mask'] = torch.tensor(state['action_mask'], dtype = torch.float).unsqueeze(0)
                         model.train(False)
                         with torch.no_grad():
-                            logits, value,_ = model(state)
+                            logits, value, _ = model(state)
                             action_dist = torch.distributions.Categorical(logits = logits)
                             action = action_dist.sample().item()
                             value = value.item()
+                            
+                            # 记录动作概率和熵
+                            action_prob = action_dist.probs[0, action].item()
+                            entropy = action_dist.entropy().item()
+                            
                         actions[agent_name] = action
                         values[agent_name] = value
                         agent_data['action'].append(actions[agent_name])
                         agent_data['value'].append(values[agent_name])
+                        agent_data['action_probs'].append(action_prob)
+                        agent_data['entropy'].append(entropy)
+                        
+                        # 统计动作类型（简化版本）
+                        if action == 0:
+                            episode_action_counts['Pass'] += 1
+                        elif action == 1:
+                            episode_action_counts['Hu'] += 1
+                        elif action < 36:
+                            episode_action_counts['Play'] += 1
+                        elif action < 99:
+                            episode_action_counts['Chi'] += 1
+                        elif action < 133:
+                            episode_action_counts['Peng'] += 1
+                        else:
+                            episode_action_counts['Gang'] += 1
+                            
                     # interact with env
                     try:
                         next_obs, rewards, done = env.step(actions)
@@ -162,13 +200,57 @@ class Actor(Process):
                 if step_count >= max_steps:
                     print(f"{self.name} episode {episode} reached max steps ({max_steps})")
                 
-                # 只有在成功完成episode时才记录奖励
+                # 记录episode统计信息
                 if step_count > 0 and 'rewards' in locals() and rewards:
-                    # 记录奖励到 TensorBoard
-                    # print(self.name, 'Episode', episode, 'Model', latest['id'], 'Reward', rewards['player_1'], 'Steps', step_count)
-                    writer.add_scalar(f'Reward/{self.name}', rewards['player_1'], latest['id'])
-                    avg_reward = sum(rewards.values()) / len(rewards)
-                    writer.add_scalar('Reward/average_all_players', avg_reward, latest['id'])
+                    self.episode_count += 1
+                    episode_reward = rewards['player_1']
+                    total_reward += episode_reward
+                    episode_lengths.append(step_count)
+                    
+                    # 判断是否获胜
+                    if episode_reward > 0:
+                        win_count += 1
+                    
+                    # 更新动作统计
+                    for action_type, count in episode_action_counts.items():
+                        action_counts[action_type] += count
+                    
+                    # 记录到 TensorBoard (每100个episode记录一次)
+                    if episode % 100 == 0:
+                        # 基础指标
+                        writer.add_scalar(f'Episode/Reward/{self.name}', episode_reward, episode)
+                        writer.add_scalar(f'Episode/Length/{self.name}', step_count, episode)
+                        writer.add_scalar(f'Episode/WinRate/{self.name}', win_count / max(1, self.episode_count), episode)
+                        
+                        # 平均指标
+                        avg_reward = total_reward / max(1, self.episode_count)
+                        avg_length = np.mean(episode_lengths[-100:]) if episode_lengths else 0
+                        writer.add_scalar(f'Episode/AvgReward/{self.name}', avg_reward, episode)
+                        writer.add_scalar(f'Episode/AvgLength/{self.name}', avg_length, episode)
+                        
+                        # 动作分布
+                        total_actions = sum(action_counts.values())
+                        if total_actions > 0:
+                            for action_type, count in action_counts.items():
+                                writer.add_scalar(f'Actions/{action_type}_ratio/{self.name}', 
+                                                count / total_actions, episode)
+                        
+                        # 策略质量指标
+                        if len(episode_data['player_1']['action_probs']) > 0:
+                            avg_action_prob = np.mean(episode_data['player_1']['action_probs'])
+                            avg_entropy = np.mean(episode_data['player_1']['entropy'])
+                            writer.add_scalar(f'Policy/AvgActionProb/{self.name}', avg_action_prob, episode)
+                            writer.add_scalar(f'Policy/AvgEntropy/{self.name}', avg_entropy, episode)
+                    
+                    # 记录总体episode进度
+                    total_completed = sum(1 for actor_id in range(self.config['num_actors']) 
+                                        if actor_id <= int(self.name.split('-')[1])) * self.episode_count
+                    
+                    if episode % 500 == 0:  # 每500个episode记录一次
+                        with open(episode_progress_file, 'a', encoding='utf-8') as f:
+                            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            f.write(f"[{timestamp}] {self.name} completed {self.episode_count} episodes, "
+                                   f"Total completed episodes: {total_completed}\n")
                 else:
                     print(f"{self.name} Episode {episode} failed - no valid rewards")
                 
@@ -178,7 +260,6 @@ class Actor(Process):
                     if (len(agent_data['action']) == 0 or 
                         len(agent_data['state']['observation']) == 0 or
                         len(agent_data['reward']) == 0):
-                        # print(f"{self.name} skipping {agent_name} due to empty data")  # 注释掉，这是正常的
                         continue
                     
                     # 调整数据长度一致性 - 麻将中action和reward的对应关系可能不同
@@ -222,13 +303,18 @@ class Actor(Process):
                             'target': td_target
                         })
                     except Exception as e:
-                        # print(f"{self.name} error processing {agent_name}: {e}")  # 静默处理
                         continue
             
             except Exception as e:
                 print(f"{self.name} episode {episode} failed: {e}")
                 continue
                 
+        # 最终统计
+        print(f"{self.name} finished all episodes. Final stats:")
+        print(f"  - Total episodes: {self.episode_count}")
+        print(f"  - Win rate: {win_count / max(1, self.episode_count):.3f}")
+        print(f"  - Average reward: {total_reward / max(1, self.episode_count):.3f}")
+        print(f"  - Average episode length: {np.mean(episode_lengths):.1f}")
+        
         # 关闭 writer
-        print(f"{self.name} finished all episodes. Closing TensorBoard writer.")
         writer.close()
