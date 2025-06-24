@@ -36,7 +36,7 @@ if __name__ == '__main__':
         'model_pool_size': 20,
         'model_pool_name': 'model-pool',  
         'num_actors': 24,
-        'episodes_per_actor': 20000,   # 增加训练轮次
+        'episodes_per_actor': 200000,   # 增加训练轮次
         'gamma': 0.99,                 # 稍微增加折扣因子
         'lambda': 0.95,
         'min_sample': 500,             # 增加最小采样数
@@ -57,7 +57,7 @@ if __name__ == '__main__':
         'training_dir': current_training_dir,  
         'timestamp': timestamp,  
 
-        'max_learner_iterations': 100000,  # 增加最大迭代次数
+        'max_learner_iterations': 10000000,  # 增加最大迭代次数
         
         # LSTM相关配置
         'lstm_hidden_size': 256,

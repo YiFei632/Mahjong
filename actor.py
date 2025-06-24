@@ -80,31 +80,38 @@ class Actor(Process):
                 
                 # run one episode and collect data
                 obs = None
-                for reset_attempt in range(3):  # 最多重试3次
+                episode_reset_attempts = 0
+                max_reset_attempts = 5
+                
+                while episode_reset_attempts < max_reset_attempts:
                     try:
                         obs = env.reset()
                         if obs and len(obs) > 0:
                             reset_failures = 0  # 重置失败计数
                             break
                         else:
-                            print(f"{self.name} env.reset() returned empty obs, attempt {reset_attempt+1}")
+                            print(f"{self.name} env.reset() returned empty obs, attempt {episode_reset_attempts+1}")
+                            episode_reset_attempts += 1
                     except Exception as e:
-                        print(f"{self.name} env.reset() failed, attempt {reset_attempt+1}: {e}")
-                        if reset_attempt == 2:  # 最后一次尝试
+                        print(f"{self.name} env.reset() failed, attempt {episode_reset_attempts+1}: {e}")
+                        episode_reset_attempts += 1
+                        if episode_reset_attempts >= max_reset_attempts:
                             reset_failures += 1
                             if reset_failures >= max_reset_failures:
                                 print(f"{self.name} too many reset failures, recreating environment")
                                 # 重新创建环境
-                                env = MahjongGBEnv(config = {'agent_clz': FeatureAgent})
-                                reset_failures = 0
                                 try:
+                                    env = MahjongGBEnv(config = {'agent_clz': FeatureAgent})
+                                    reset_failures = 0
                                     obs = env.reset()
-                                except:
-                                    print(f"{self.name} even new environment failed to reset")
+                                    if obs and len(obs) > 0:
+                                        break
+                                except Exception as recreate_error:
+                                    print(f"{self.name} failed to recreate environment: {recreate_error}")
                                     obs = None
                 
                 if not obs or len(obs) == 0:
-                    print(f"{self.name} skipping episode {episode} - reset failed")
+                    print(f"{self.name} skipping episode {episode} - reset failed after {max_reset_attempts} attempts")
                     continue
                 
                 episode_data = {agent_name: {
@@ -178,10 +185,19 @@ class Actor(Process):
                         next_obs, rewards, done = env.step(actions)
                         
                         # 检查环境返回是否有效
-                        if not next_obs or len(next_obs) == 0:
+                        if next_obs is None:
+                            print(f"{self.name} env.step() returned None at step {step_count}, ending episode")
+                            done = True
+                            # 创建默认奖励
+                            rewards = {name: 0 for name in env.agent_names}
+                        elif len(next_obs) == 0:
                             print(f"{self.name} env.step() returned empty obs at step {step_count}, ending episode")
                             done = True
                             # 创建默认奖励
+                            rewards = {name: 0 for name in env.agent_names}
+                        
+                        # 确保rewards不为空
+                        if not rewards:
                             rewards = {name: 0 for name in env.agent_names}
                         
                         for agent_name in rewards:
@@ -191,6 +207,22 @@ class Actor(Process):
                         
                     except Exception as e:
                         print(f"{self.name} env.step() failed at step {step_count}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        done = True
+                        rewards = {name: 0 for name in env.agent_names}
+                        for agent_name in env.agent_names:
+                            if agent_name in episode_data:  # 只为存在的agent添加奖励
+                                episode_data[agent_name]['reward'].append(0)                        
+                        for agent_name in rewards:
+                            if agent_name in episode_data:  # 只为存在的agent添加奖励
+                                episode_data[agent_name]['reward'].append(rewards[agent_name])
+                        obs = next_obs
+                        
+                    except Exception as e:
+                        print(f"{self.name} env.step() failed at step {step_count}: {e}")
+                        import traceback
+                        traceback.print_exc()
                         done = True
                         rewards = {name: 0 for name in env.agent_names}
                         for agent_name in env.agent_names:
@@ -242,15 +274,12 @@ class Actor(Process):
                             writer.add_scalar(f'Policy/AvgActionProb/{self.name}', avg_action_prob, episode)
                             writer.add_scalar(f'Policy/AvgEntropy/{self.name}', avg_entropy, episode)
                     
-                    # 记录总体episode进度
-                    total_completed = sum(1 for actor_id in range(self.config['num_actors']) 
-                                        if actor_id <= int(self.name.split('-')[1])) * self.episode_count
-                    
+                    # 记录episode进度 - 修正总计算逻辑
                     if episode % 500 == 0:  # 每500个episode记录一次
                         with open(episode_progress_file, 'a', encoding='utf-8') as f:
                             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            f.write(f"[{timestamp}] {self.name} completed {self.episode_count} episodes, "
-                                   f"Total completed episodes: {total_completed}\n")
+                            # 修正：只记录当前Actor的进度，不计算"总计"
+                            f.write(f"[{timestamp}] {self.name} completed {self.episode_count} episodes\n")
                 else:
                     print(f"{self.name} Episode {episode} failed - no valid rewards")
                 

@@ -74,7 +74,7 @@ class Learner(Process):
         max_iterations = self.config.get('max_learner_iterations', float('inf'))
         e_per_actor = self.config.get('episodes_per_actor', float('inf'))
         num_actor = self.config.get('num_actors', float('inf'))
-        iter = num_actor * e_per_actor
+        iter = e_per_actor + num_actor * 80
         
         # 额外的统计指标
         running_losses = {'policy': [], 'value': [], 'entropy': [], 'total': []}
