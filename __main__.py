@@ -9,17 +9,24 @@ import numpy as np
 import torch
 
 def obs2response(model, obs):
-    logits, value = model({'observation': torch.from_numpy(np.expand_dims(obs['observation'], 0)), 'action_mask': torch.from_numpy(np.expand_dims(obs['action_mask'], 0))})
+    logits, value, _ = model({'observation': torch.from_numpy(np.expand_dims(obs['observation'], 0)), 'action_mask': torch.from_numpy(np.expand_dims(obs['action_mask'], 0))})
     action = logits.detach().numpy().flatten().argmax()
     response = agent.action2response(action)
+
     return response
 
 import sys
 
 if __name__ == '__main__':
     model = CNNLSTMModel()
-    data_dir = './models/best_model.pt'
-    # model.load_state_dict(torch.load(data_dir, map_location = torch.device('cpu')))
+    data_dir = '/data/latest_model_1.pt'
+    
+    # 初始化全局变量
+    agent = None
+    angang = None
+    zimo = False
+    seatWind = 0
+    
     # 正确的代码:
     # 1. 先加载完整的检查点文件
     checkpoint = torch.load(data_dir, map_location = torch.device('cpu'))
@@ -27,18 +34,22 @@ if __name__ == '__main__':
     model.load_state_dict(checkpoint['model_state_dict'])
     model.train(False)
     input() # 1
+    
     while True:
         request = input()
         while not request.strip(): request = input()
         request = request.split()
+        
         if request[0] == '0':
             seatWind = int(request[1])
             agent = FeatureAgent(seatWind)
             agent.request2obs('Wind %s' % request[2])
             print('PASS')
+            
         elif request[0] == '1':
             agent.request2obs(' '.join(['Deal', *request[5:]]))
             print('PASS')
+            
         elif request[0] == '2':
             obs = agent.request2obs('Draw %s' % request[1])
             response = obs2response(model, obs)
@@ -52,6 +63,7 @@ if __name__ == '__main__':
                 angang = response[1]
             elif response[0] == 'BuGang':
                 print('BUGANG %s' % response[1])
+                
         elif request[0] == '3':
             p = int(request[1])
             if request[2] == 'DRAW':
@@ -100,5 +112,7 @@ if __name__ == '__main__':
                         response2 = obs2response(model, obs)
                         print(' '.join([response[0].upper(), *response[1:], response2.split()[-1]]))
                         agent.request2obs('Player %d Un' % seatWind + ' '.join(response))
+                    else:
+                        print('PASS')
         print('>>>BOTZONE_REQUEST_KEEP_RUNNING<<<')
         sys.stdout.flush()

@@ -43,7 +43,7 @@ if __name__ == '__main__':
         'batch_size': 256,             # 增加批次大小
         'epochs': 2,
         'clip': 0.1,
-        'lr': 5e-5,                    # 调整学习率
+        'lr': 2e-5,                    # 调整学习率
         'lr_decay': 0.99,              # 添加学习率衰减
         'value_coeff': 1,            # 调整价值函数权重
         'entropy_coeff': 0.01,
@@ -51,8 +51,8 @@ if __name__ == '__main__':
         
         'ckpt_save_interval': 300,
         'ckpt_save_path': model_dir,  
-        'save_every_n_iterations': 200,  # 增加保存间隔
-        'save_state_dict_every': 1000,
+        'save_every_n_iterations': 1200,  # 增加保存间隔
+        'save_state_dict_every': 3000,
         'log_dir': log_dir,  
         'training_dir': current_training_dir,  
         'timestamp': timestamp,  
@@ -66,7 +66,7 @@ if __name__ == '__main__':
         'lstm_hidden_size': 256,
         'lstm_layers': 2,
         'dropout': 0.1,
-        'max_grad_norm': 0.4,
+        'max_grad_norm': 0.3,
         'weight_decay': 5e-4,        
     }
 

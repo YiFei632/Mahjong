@@ -53,18 +53,26 @@ class Actor(Process):
         
         model.load_state_dict(state_dict)
         
-        # collect data
-        env = MahjongGBEnv(config = {'agent_clz': FeatureAgent})
+
+        env_config = {
+            'agent_clz': FeatureAgent,
+            'tensorboard_writer': writer
+        }
+        env = MahjongGBEnv(config=env_config)
         policies = {player : model for player in env.agent_names}
         
         reset_failures = 0
         max_reset_failures = 5
         
-        # 统计指标
+
         win_count = 0
+        huang_count = 0
+        tenpai_count = 0
         total_reward = 0
         episode_lengths = []
         action_counts = {'Pass': 0, 'Play': 0, 'Chi': 0, 'Peng': 0, 'Gang': 0, 'Hu': 0}
+        shanten_stats = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+        win_by_fan = {}
         
         episode_progress_file = os.path.join(self.config['training_dir'], 'episode_progress.txt')
         
@@ -99,9 +107,13 @@ class Actor(Process):
                             reset_failures += 1
                             if reset_failures >= max_reset_failures:
                                 print(f"{self.name} too many reset failures, recreating environment")
-                                # 重新创建环境
+
                                 try:
-                                    env = MahjongGBEnv(config = {'agent_clz': FeatureAgent})
+                                    env_config = {
+                                        'agent_clz': FeatureAgent,
+                                        'tensorboard_writer': writer
+                                    }
+                                    env = MahjongGBEnv(config=env_config)
                                     reset_failures = 0
                                     obs = env.reset()
                                     if obs and len(obs) > 0:
@@ -213,20 +225,6 @@ class Actor(Process):
                         rewards = {name: 0 for name in env.agent_names}
                         for agent_name in env.agent_names:
                             if agent_name in episode_data:  # 只为存在的agent添加奖励
-                                episode_data[agent_name]['reward'].append(0)                        
-                        for agent_name in rewards:
-                            if agent_name in episode_data:  # 只为存在的agent添加奖励
-                                episode_data[agent_name]['reward'].append(rewards[agent_name])
-                        obs = next_obs
-                        
-                    except Exception as e:
-                        print(f"{self.name} env.step() failed at step {step_count}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        done = True
-                        rewards = {name: 0 for name in env.agent_names}
-                        for agent_name in env.agent_names:
-                            if agent_name in episode_data:  # 只为存在的agent添加奖励
                                 episode_data[agent_name]['reward'].append(0)
                 
                 if step_count >= max_steps:
@@ -246,6 +244,27 @@ class Actor(Process):
                     # 更新动作统计
                     for action_type, count in episode_action_counts.items():
                         action_counts[action_type] += count
+                    
+
+                    if hasattr(env, 'episode_stats'):
+                        episode_stats = env.episode_stats
+                        
+                        # 平局统计
+                        if episode_stats.get('is_huang', False):
+                            huang_count += 1
+                            tenpai_players = episode_stats.get('huang_tenpai_players', 0)
+                            tenpai_count += tenpai_players
+                        
+                        # 胜利番数统计
+                        if episode_stats.get('winner', -1) != -1:
+                            fan_count = episode_stats.get('fan_count', 0)
+                            if fan_count > 0:
+                                win_by_fan[fan_count] = win_by_fan.get(fan_count, 0) + 1
+                        
+                        # 向听数统计
+                        for player_shanten in episode_stats.get('final_shanten', []):
+                            if player_shanten in shanten_stats:
+                                shanten_stats[player_shanten] += 1
                     
                     # 记录到 TensorBoard (每100个episode记录一次)
                     if episode % 100 == 0:
@@ -273,6 +292,29 @@ class Actor(Process):
                             avg_entropy = np.mean(episode_data['player_1']['entropy'])
                             writer.add_scalar(f'Policy/AvgActionProb/{self.name}', avg_action_prob, episode)
                             writer.add_scalar(f'Policy/AvgEntropy/{self.name}', avg_entropy, episode)
+                        
+
+                        if self.episode_count > 0:
+                            huang_rate = huang_count / self.episode_count
+                            writer.add_scalar(f'Game/HuangRate/{self.name}', huang_rate, episode)
+                            
+                            if huang_count > 0:
+                                avg_tenpai_per_huang = tenpai_count / huang_count
+                                writer.add_scalar(f'Game/AvgTenpaiPerHuang/{self.name}', avg_tenpai_per_huang, episode)
+                        
+                        # 向听数分布
+                        total_shanten_records = sum(shanten_stats.values())
+                        if total_shanten_records > 0:
+                            for shanten, count in shanten_stats.items():
+                                rate = count / total_shanten_records
+                                writer.add_scalar(f'Shanten/Distribution_{shanten}Shanten/{self.name}', rate, episode)
+                        
+                        # 番数分布
+                        if win_by_fan:
+                            total_wins = sum(win_by_fan.values())
+                            for fan_count, count in win_by_fan.items():
+                                rate = count / total_wins
+                                writer.add_scalar(f'Win/FanDistribution_{fan_count}Fan/{self.name}', rate, episode)
                     
                     # 记录episode进度 - 修正总计算逻辑
                     if episode % 500 == 0:  # 每500个episode记录一次
@@ -350,10 +392,13 @@ class Actor(Process):
                 print(f"{self.name} episode {episode} failed: {e}")
                 continue
                 
-        # 最终统计
+
         print(f"{self.name} finished all episodes. Final stats:")
         print(f"  - Total episodes: {self.episode_count}")
         print(f"  - Win rate: {win_count / max(1, self.episode_count):.3f}")
+        print(f"  - Huang rate: {huang_count / max(1, self.episode_count):.3f}")
+        if huang_count > 0:
+            print(f"  - Avg tenpai per huang: {tenpai_count / huang_count:.2f}")
         print(f"  - Average reward: {total_reward / max(1, self.episode_count):.3f}")
         print(f"  - Average episode length: {np.mean(episode_lengths):.1f}")
         

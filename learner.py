@@ -20,6 +20,13 @@ class Learner(Process):
         self.config = config
         self.model_pool = None
     
+    def huber_loss(self, pred, target, delta=1.0):
+        """Huber损失函数，比MSE更稳定"""
+        error = pred - target
+        return torch.where(torch.abs(error) < delta,
+                          0.5 * error ** 2,
+                          delta * (torch.abs(error) - 0.5 * delta))
+    
     def run(self):
         # --- 使用配置中的日志目录 ---
         writer = SummaryWriter(log_dir=self.config['log_dir'])
@@ -42,19 +49,83 @@ class Learner(Process):
         model_pool.push(model.state_dict())
         model = model.to(device)
         
-        # training
-        optimizer = torch.optim.Adam(
-            model.parameters(), 
-            lr=self.config.get('lr', 5e-5),
+        # === 修正的分离优化器设置 ===
+        print("Model parameters:")
+        all_param_names = []
+        for name, param in model.named_parameters():
+            print(f"  {name}: {param.shape}")
+            all_param_names.append(name)
+        
+
+        actor_params = []
+        critic_params = []
+        shared_params = []
+        
+        for name, param in model.named_parameters():
+            if 'policy_head' in name:
+                actor_params.append(param)
+            elif 'value_head' in name:
+                critic_params.append(param)
+            else:
+                shared_params.append(param)
+        
+        print(f"Actor parameters (policy_head): {len(actor_params)}")
+        print(f"Critic parameters (value_head): {len(critic_params)}")
+        print(f"Shared parameters (features): {len(shared_params)}")
+        
+
+        if len(actor_params) == 0:
+            print("Warning: No 'policy_head' found, using backup method")
+            actor_params = [p for name, p in model.named_parameters() if 'value_head' not in name]
+            critic_params = [p for name, p in model.named_parameters() if 'value_head' in name]
+            shared_params = []
+            print(f"Backup - Actor parameters: {len(actor_params)}")
+            print(f"Backup - Critic parameters: {len(critic_params)}")
+        
+
+        actor_optimizer = torch.optim.Adam(
+            actor_params,
+            lr=self.config.get('actor_lr', self.config.get('lr', 1e-5)),
             weight_decay=self.config.get('weight_decay', 5e-4),
             eps=1e-8
         )
         
-        # 学习率调度器
-        lr_decay = self.config.get('lr_decay', 0.99)
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=lr_decay)
+        critic_optimizer = torch.optim.Adam(
+            critic_params,
+            lr=self.config.get('critic_lr', self.config.get('lr', 1e-5)),  # 降低critic学习率
+            weight_decay=self.config.get('weight_decay', 5e-4),
+            eps=1e-8
+        )
         
-        max_grad_norm = self.config.get('max_grad_norm', 1.0)
+
+        shared_optimizer = None
+        shared_scheduler = None
+        if len(shared_params) > 0:
+            shared_optimizer = torch.optim.Adam(
+                shared_params,
+                lr=self.config.get('shared_lr', self.config.get('lr', 1e-5)),
+                weight_decay=self.config.get('weight_decay', 5e-4),
+                eps=1e-8
+            )
+            shared_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                shared_optimizer, 
+                gamma=self.config.get('shared_lr_decay', self.config.get('lr_decay', 0.99))
+            )
+        
+
+        actor_lr_decay = self.config.get('actor_lr_decay', self.config.get('lr_decay', 0.99))
+        critic_lr_decay = self.config.get('critic_lr_decay', self.config.get('lr_decay', 0.99))
+        actor_scheduler = torch.optim.lr_scheduler.ExponentialLR(actor_optimizer, gamma=actor_lr_decay)
+        critic_scheduler = torch.optim.lr_scheduler.ExponentialLR(critic_optimizer, gamma=critic_lr_decay)
+        
+        # 分离的梯度裁剪 - 严格控制critic
+        actor_max_grad_norm = self.config.get('actor_max_grad_norm', self.config.get('max_grad_norm', 0.1))
+        critic_max_grad_norm = self.config.get('critic_max_grad_norm', 0.1)  
+        shared_max_grad_norm = self.config.get('shared_max_grad_norm', 0.3)
+        
+        # 其他配置
+        use_huber_loss = self.config.get('value_huber_loss', True)
+        huber_delta = self.config.get('value_huber_delta', 1.0)
         
         progress_file = os.path.join(self.config['training_dir'], 'training_progress.txt')
         
@@ -77,18 +148,22 @@ class Learner(Process):
         num_actor = self.config.get('num_actors', float('inf'))
         iter = e_per_actor + num_actor * 80
         
-        # 额外的统计指标
-        running_losses = {'policy': [], 'value': [], 'entropy': [], 'total': []}
-        gradient_norms = []
+        # 额外的统计指标 - 增加分离的损失统计
+        running_losses = {'policy': [], 'value': [], 'entropy': [], 'total': [], 'actor_total': [], 'critic_total': []}
+        gradient_norms = {'actor': [], 'critic': [], 'shared': []}
         sample_efficiency_log = []
         
         log_progress(f"Starting training in {self.config['training_dir']}")
         log_progress(f"Learner will run for a maximum of {max_iterations} iterations")
+        log_progress(f"Using separated Actor-Critic training (FIXED)")
+        log_progress(f"Actor LR: {actor_optimizer.param_groups[0]['lr']}, "
+                    f"Critic LR: {critic_optimizer.param_groups[0]['lr']}")
+        if shared_optimizer:
+            log_progress(f"Shared LR: {shared_optimizer.param_groups[0]['lr']}")
         
-
         progress_bar = tqdm(
             total=iter,
-            desc="Learner Training",
+            desc="Learner Training (AC-Fixed)",
             unit="iter",
             ncols=120,
             position=0,
@@ -114,43 +189,77 @@ class Learner(Process):
                 advs = torch.tensor(batch['adv']).to(device)
                 targets = torch.tensor(batch['target']).to(device)
                 
-                # calculate PPO loss
+                # calculate PPO loss - 获取old probabilities
                 model.train(True)
-                old_logits, _, _ = model(states)
-                old_probs = F.softmax(old_logits, dim=1).gather(1, actions)
-                old_log_probs = torch.log(old_probs + 1e-8).detach()
+                with torch.no_grad():
+                    old_logits, _, _ = model(states)
+                    old_probs = F.softmax(old_logits, dim=1).gather(1, actions)
+                    old_log_probs = torch.log(old_probs + 1e-8)
                 
-                epoch_losses = {'policy': [], 'value': [], 'entropy': [], 'total': []}
+                # 损失统计
+                epoch_losses = {'policy': [], 'value': [], 'entropy': [], 'actor_total': [], 'critic_total': []}
                 
+
                 for epoch in range(self.config['epochs']):
+                    
+                    # 前向传播
                     logits, values, _ = model(states)
                     action_dist = torch.distributions.Categorical(logits=logits)
                     probs = F.softmax(logits, dim=1).gather(1, actions)
                     log_probs = torch.log(probs + 1e-8)
                     ratio = torch.exp(log_probs - old_log_probs)
+                    
+
                     surr1 = ratio * advs
                     surr2 = torch.clamp(ratio, 1 - self.config['clip'], 1 + self.config['clip']) * advs
                     policy_loss = -torch.mean(torch.min(surr1, surr2))
-                    value_loss = torch.mean(F.mse_loss(values.squeeze(-1), targets))
                     entropy_loss = -torch.mean(action_dist.entropy())
-                    loss = policy_loss + self.config['value_coeff'] * value_loss + self.config['entropy_coeff'] * entropy_loss
+                    actor_loss = policy_loss + self.config['entropy_coeff'] * entropy_loss
                     
-                    optimizer.zero_grad()
-                    loss.backward()
+                    # 执行Actor更新
+                    actor_optimizer.zero_grad()
+                    if shared_optimizer:
+                        shared_optimizer.zero_grad()
                     
-                    # 记录梯度范数
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                    gradient_norms.append(grad_norm.item())
+                    actor_loss.backward(retain_graph=True)
+                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor_params, actor_max_grad_norm)
                     
-                    optimizer.step()
+                    # 如果有共享参数，也要裁剪共享参数的梯度
+                    shared_grad_norm = 0.0
+                    if shared_optimizer:
+                        shared_grad_norm = torch.nn.utils.clip_grad_norm_(shared_params, shared_max_grad_norm)
+                        shared_optimizer.step()
+                    
+                    actor_optimizer.step()
                     
                     epoch_losses['policy'].append(policy_loss.item())
-                    epoch_losses['value'].append(value_loss.item())
                     epoch_losses['entropy'].append(entropy_loss.item())
-                    epoch_losses['total'].append(loss.item())
+                    epoch_losses['actor_total'].append(actor_loss.item())
+                    gradient_norms['actor'].append(actor_grad_norm.item())
+                    if shared_optimizer:
+                        gradient_norms['shared'].append(shared_grad_norm.item())
+                    
+                    _, values_new, _ = model(states)
+                    if use_huber_loss:
+                        value_loss = torch.mean(self.huber_loss(values_new.squeeze(-1), targets, huber_delta))
+                    else:
+                        value_loss = torch.mean(F.mse_loss(values_new.squeeze(-1), targets))
+                    
+                    critic_optimizer.zero_grad()
+                    value_loss.backward()
+                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic_params, critic_max_grad_norm)
+                    critic_optimizer.step()
+                    
+                    epoch_losses['value'].append(value_loss.item())
+                    epoch_losses['critic_total'].append(value_loss.item())
+                    gradient_norms['critic'].append(critic_grad_norm.item())
                 
                 # 计算平均损失
                 avg_losses = {k: np.mean(v) for k, v in epoch_losses.items()}
+                
+                # 计算总损失（用于显示和保存最佳模型）
+                total_loss = avg_losses['policy'] + self.config.get('value_coeff', 0.5) * avg_losses['value'] + self.config['entropy_coeff'] * avg_losses['entropy']
+                avg_losses['total'] = total_loss
                 
                 # 更新运行损失历史
                 for k, v in avg_losses.items():
@@ -160,7 +269,7 @@ class Learner(Process):
                 
                 # 更新进度条
                 progress_bar.update(1)
-                progress_bar.set_postfix_str(f"{avg_losses['total']:.4f}")
+                progress_bar.set_postfix_str(f"Total: {avg_losses['total']:.4f}, Policy: {avg_losses['policy']:.4f}, Value: {avg_losses['value']:.4f}")
                 
                 # 每100次迭代输出详细信息
                 if iterations % 100 == 0:
@@ -168,16 +277,31 @@ class Learner(Process):
                     sample_efficiency = buffer_stats['sample_out'] / max(1, buffer_stats['sample_in'])
                     sample_efficiency_log.append(sample_efficiency)
                     
-                    tqdm.write(f'Iteration {iterations}, Average Loss: {avg_losses["total"]:.4f}, '
-                              f'Buffer: {self.replay_buffer.size()}, Sample Efficiency: {sample_efficiency:.3f}')
+                    grad_info = f'ActorGrad: {gradient_norms["actor"][-1]:.3f}, CriticGrad: {gradient_norms["critic"][-1]:.3f}'
+                    if shared_optimizer and gradient_norms['shared']:
+                        grad_info += f', SharedGrad: {gradient_norms["shared"][-1]:.3f}'
+                    
+                    tqdm.write(f'Iteration {iterations}, Total Loss: {avg_losses["total"]:.4f}, '
+                              f'Policy: {avg_losses["policy"]:.4f}, Value: {avg_losses["value"]:.4f}, '
+                              f'Actor: {avg_losses["actor_total"]:.4f}, Critic: {avg_losses["critic_total"]:.4f}, '
+                              f'Buffer: {self.replay_buffer.size()}, {grad_info}')
                 
                 # 记录到 TensorBoard
                 writer.add_scalar('Loss/total', avg_losses['total'], iterations)
                 writer.add_scalar('Loss/policy', avg_losses['policy'], iterations)
                 writer.add_scalar('Loss/value', avg_losses['value'], iterations)
                 writer.add_scalar('Loss/entropy', avg_losses['entropy'], iterations)
-                writer.add_scalar('Training/learning_rate', optimizer.param_groups[0]['lr'], iterations)
-                writer.add_scalar('Training/gradient_norm', gradient_norms[-1], iterations)
+                writer.add_scalar('Loss/actor_total', avg_losses['actor_total'], iterations)
+                writer.add_scalar('Loss/critic_total', avg_losses['critic_total'], iterations)
+                
+                # 记录分离的训练指标
+                writer.add_scalar('Training/actor_learning_rate', actor_optimizer.param_groups[0]['lr'], iterations)
+                writer.add_scalar('Training/critic_learning_rate', critic_optimizer.param_groups[0]['lr'], iterations)
+                writer.add_scalar('Training/actor_gradient_norm', gradient_norms['actor'][-1], iterations)
+                writer.add_scalar('Training/critic_gradient_norm', gradient_norms['critic'][-1], iterations)
+                if shared_optimizer and gradient_norms['shared']:
+                    writer.add_scalar('Training/shared_learning_rate', shared_optimizer.param_groups[0]['lr'], iterations)
+                    writer.add_scalar('Training/shared_gradient_norm', gradient_norms['shared'][-1], iterations)
                 writer.add_scalar('Training/replay_buffer_size', self.replay_buffer.size(), iterations)
                 
                 # 额外的统计指标
@@ -189,11 +313,19 @@ class Learner(Process):
                         writer.add_scalar('Loss/recent_avg_total', recent_avg_loss, iterations)
                         writer.add_scalar('Loss/recent_avg_policy', np.mean(running_losses['policy'][-recent_window:]), iterations)
                         writer.add_scalar('Loss/recent_avg_value', np.mean(running_losses['value'][-recent_window:]), iterations)
+                        writer.add_scalar('Loss/recent_avg_actor', np.mean(running_losses['actor_total'][-recent_window:]), iterations)
+                        writer.add_scalar('Loss/recent_avg_critic', np.mean(running_losses['critic_total'][-recent_window:]), iterations)
                     
                     # 梯度统计
-                    if len(gradient_norms) >= 10:
-                        writer.add_scalar('Training/avg_gradient_norm', np.mean(gradient_norms[-10:]), iterations)
-                        writer.add_scalar('Training/gradient_norm_std', np.std(gradient_norms[-10:]), iterations)
+                    if len(gradient_norms['actor']) >= 10:
+                        writer.add_scalar('Training/avg_actor_gradient_norm', np.mean(gradient_norms['actor'][-10:]), iterations)
+                        writer.add_scalar('Training/actor_gradient_norm_std', np.std(gradient_norms['actor'][-10:]), iterations)
+                    if len(gradient_norms['critic']) >= 10:
+                        writer.add_scalar('Training/avg_critic_gradient_norm', np.mean(gradient_norms['critic'][-10:]), iterations)
+                        writer.add_scalar('Training/critic_gradient_norm_std', np.std(gradient_norms['critic'][-10:]), iterations)
+                    if shared_optimizer and len(gradient_norms['shared']) >= 10:
+                        writer.add_scalar('Training/avg_shared_gradient_norm', np.mean(gradient_norms['shared'][-10:]), iterations)
+                        writer.add_scalar('Training/shared_gradient_norm_std', np.std(gradient_norms['shared'][-10:]), iterations)
                     
                     # 采样效率
                     if sample_efficiency_log:
@@ -204,7 +336,7 @@ class Learner(Process):
                         policy_entropy = torch.mean(action_dist.entropy()).item()
                         writer.add_scalar('Policy/avg_entropy', policy_entropy, iterations)
                         
-                        # KL散度估计 (近似)
+                        # KL散度估计
                         kl_div = torch.mean(old_log_probs - log_probs).item()
                         writer.add_scalar('Policy/kl_divergence', kl_div, iterations)
                 
@@ -222,52 +354,46 @@ class Learner(Process):
                 if should_save_time or should_save_best or should_save_periodic:
                     model_cpu = model.to('cpu')
                     
+                    checkpoint_data = {
+                        'model_state_dict': model_cpu.state_dict(),
+                        'actor_optimizer_state_dict': actor_optimizer.state_dict(),
+                        'critic_optimizer_state_dict': critic_optimizer.state_dict(),
+                        'actor_scheduler_state_dict': actor_scheduler.state_dict(),
+                        'critic_scheduler_state_dict': critic_scheduler.state_dict(),
+                        'iteration': iterations,
+                        'loss': avg_losses['total'],
+                        'losses_breakdown': avg_losses,
+                        'config': self.config,
+                        'timestamp': self.config['timestamp'],
+                        'training_time': t - cur_time if should_save_time else None,
+                        'actor_gradient_norm': gradient_norms['actor'][-1] if gradient_norms['actor'] else 0,
+                        'critic_gradient_norm': gradient_norms['critic'][-1] if gradient_norms['critic'] else 0,
+                        'training_type': 'separated_actor_critic_fixed'
+                    }
+                    
+                    # 如果有共享优化器，也保存其状态
+                    if shared_optimizer:
+                        checkpoint_data['shared_optimizer_state_dict'] = shared_optimizer.state_dict()
+                        checkpoint_data['shared_scheduler_state_dict'] = shared_scheduler.state_dict()
+                        checkpoint_data['shared_gradient_norm'] = gradient_norms['shared'][-1] if gradient_norms['shared'] else 0
+                    
                     if should_save_time or should_save_periodic:
                         checkpoint_path = os.path.join(
                             self.config['ckpt_save_path'], 
                             f'model_iter_{iterations:06d}_loss_{avg_losses["total"]:.4f}.pt'
                         )
-                        torch.save({
-                            'model_state_dict': model_cpu.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scheduler_state_dict': scheduler.state_dict(),
-                            'iteration': iterations,
-                            'loss': avg_losses['total'],
-                            'losses_breakdown': avg_losses,
-                            'config': self.config,
-                            'timestamp': self.config['timestamp'],
-                            'training_time': t - cur_time if should_save_time else None,
-                            'gradient_norm': gradient_norms[-1] if gradient_norms else 0
-                        }, checkpoint_path)
+                        torch.save(checkpoint_data, checkpoint_path)
                         tqdm.write(f'Saved checkpoint: {os.path.basename(checkpoint_path)}')
                     
                     if should_save_best:
                         best_loss = avg_losses['total']
                         best_path = os.path.join(self.config['ckpt_save_path'], 'best_model.pt')
-                        torch.save({
-                            'model_state_dict': model_cpu.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scheduler_state_dict': scheduler.state_dict(),
-                            'iteration': iterations,
-                            'loss': avg_losses['total'],
-                            'losses_breakdown': avg_losses,
-                            'config': self.config,
-                            'timestamp': self.config['timestamp'],
-                            'is_best': True
-                        }, best_path)
+                        checkpoint_data['is_best'] = True
+                        torch.save(checkpoint_data, best_path)
                         tqdm.write(f'New best model saved: loss={avg_losses["total"]:.4f}')
                     
                     latest_path = os.path.join(self.config['ckpt_save_path'], 'latest_model.pt')
-                    torch.save({
-                        'model_state_dict': model_cpu.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'iteration': iterations,
-                        'loss': avg_losses['total'],
-                        'losses_breakdown': avg_losses,
-                        'config': self.config,
-                        'timestamp': self.config['timestamp']
-                    }, latest_path)
+                    torch.save(checkpoint_data, latest_path)
                     
                     model = model_cpu.to(device)
                     
@@ -276,10 +402,16 @@ class Learner(Process):
                 
                 iterations += 1
                 
-                # 学习率衰减
+                # 分离的学习率衰减
                 if iterations % 1000 == 0:
-                    scheduler.step()
-                    writer.add_scalar('Training/learning_rate_decay', optimizer.param_groups[0]['lr'], iterations)
+                    actor_scheduler.step()
+                    critic_scheduler.step()
+                    if shared_scheduler:
+                        shared_scheduler.step()
+                    writer.add_scalar('Training/actor_learning_rate_decay', actor_optimizer.param_groups[0]['lr'], iterations)
+                    writer.add_scalar('Training/critic_learning_rate_decay', critic_optimizer.param_groups[0]['lr'], iterations)
+                    if shared_optimizer:
+                        writer.add_scalar('Training/shared_learning_rate_decay', shared_optimizer.param_groups[0]['lr'], iterations)
                 
                 # Optional: Save model state dict only
                 if iterations % self.config.get('save_state_dict_every', 500) == 0:
@@ -300,10 +432,12 @@ class Learner(Process):
         # 保存最终模型
         final_model_path = os.path.join(self.config['ckpt_save_path'], 'final_model.pt')
         model_cpu = model.to('cpu')
-        torch.save({
+        final_checkpoint = {
             'model_state_dict': model_cpu.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
+            'actor_optimizer_state_dict': actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': critic_optimizer.state_dict(),
+            'actor_scheduler_state_dict': actor_scheduler.state_dict(),
+            'critic_scheduler_state_dict': critic_scheduler.state_dict(),
             'iteration': iterations,
             'loss': avg_losses['total'],
             'losses_breakdown': avg_losses,
@@ -311,12 +445,21 @@ class Learner(Process):
             'config': self.config,
             'timestamp': self.config['timestamp'],
             'training_completed': True,
+            'training_type': 'separated_actor_critic_fixed',
             'final_stats': {
                 'total_iterations': iterations,
-                'avg_gradient_norm': np.mean(gradient_norms[-100:]) if len(gradient_norms) >= 100 else 0,
+                'avg_actor_gradient_norm': np.mean(gradient_norms['actor'][-100:]) if len(gradient_norms['actor']) >= 100 else 0,
+                'avg_critic_gradient_norm': np.mean(gradient_norms['critic'][-100:]) if len(gradient_norms['critic']) >= 100 else 0,
                 'final_sample_efficiency': sample_efficiency_log[-1] if sample_efficiency_log else 0
             }
-        }, final_model_path)
+        }
+        
+        if shared_optimizer:
+            final_checkpoint['shared_optimizer_state_dict'] = shared_optimizer.state_dict()
+            final_checkpoint['shared_scheduler_state_dict'] = shared_scheduler.state_dict()
+            final_checkpoint['final_stats']['avg_shared_gradient_norm'] = np.mean(gradient_norms['shared'][-100:]) if len(gradient_norms['shared']) >= 100 else 0
+        
+        torch.save(final_checkpoint, final_model_path)
         tqdm.write(f"Final model saved: {os.path.basename(final_model_path)}")
         
         log_progress("Closing TensorBoard writer")
