@@ -19,7 +19,7 @@ import sys
 
 if __name__ == '__main__':
     model = CNNLSTMModel()
-    data_dir = '/data/latest_model_1.pt'
+    data_dir = '/data/latest_model5.pt'
     
     # 初始化全局变量
     agent = None

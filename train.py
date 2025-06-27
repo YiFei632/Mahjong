@@ -31,44 +31,65 @@ if __name__ == '__main__':
     print("-" * 50)
 
     config = {
-        'replay_buffer_size': 30000, 
-        'replay_buffer_episode': 200, 
-        'model_pool_size': 20,
-        'model_pool_name': 'model-pool',  
-        'num_actors': 24,
-        'episodes_per_actor': 200000,   # 增加训练轮次
-        'gamma': 0.99,                 # 稍微增加折扣因子
-        'lambda': 0.95,
-        'min_sample': 200,             # 增加最小采样数
-        'batch_size': 256,             # 增加批次大小
-        'epochs': 2,
-        'clip': 0.1,
-        'lr': 2e-5,                    # 调整学习率
-        'lr_decay': 0.99,              # 添加学习率衰减
-        'value_coeff': 1,            # 调整价值函数权重
-        'entropy_coeff': 0.01,
-        'device': 'cuda',
-        
-        'ckpt_save_interval': 300,
-        'ckpt_save_path': model_dir,  
-        'save_every_n_iterations': 1200,  # 增加保存间隔
-        'save_state_dict_every': 3000,
-        'log_dir': log_dir,  
-        'training_dir': current_training_dir,  
-        'timestamp': timestamp,  
+            'replay_buffer_size': 30000, 
+            'replay_buffer_episode': 200, 
+            'model_pool_size': 20,
+            'model_pool_name': 'model-pool',  
+            'num_actors': 24,
+            'episodes_per_actor': 200000,   
+            'gamma': 0.99,                 
+            'lambda': 0.95,
+            'min_sample': 200,             
+            'batch_size': 256,             
+            'epochs': 3,                  
+            'clip': 0.1,
+            
 
-        'max_learner_iterations': 10000000,  # 增加最大迭代次数
-        
-        'batch_norm': True,
-        'advantage_norm': True,
-        
-        # LSTM相关配置
-        'lstm_hidden_size': 256,
-        'lstm_layers': 2,
-        'dropout': 0.1,
-        'max_grad_norm': 0.3,
-        'weight_decay': 5e-4,        
-    }
+            'lr': 1e-5,                    
+            'lr_decay': 0.99,              
+            
+
+            'actor_lr': 5e-6,              # Actor学习率
+            'critic_lr': 5e-7,             # Critic学习率
+            'shared_lr': 5e-6,             # 共享特征提取器学习率
+            'actor_lr_decay': 0.995,       # Actor学习率衰减
+            'critic_lr_decay': 0.99,       # Critic学习率衰减
+            'shared_lr_decay': 0.99,       # 共享特征学习率衰减
+            
+
+            'max_grad_norm': 0.3,          
+            'actor_max_grad_norm': 0.05,    # Actor梯度裁剪
+            'critic_max_grad_norm': 0.05,   # Critic梯度裁剪
+            'shared_max_grad_norm': 0.05,   # 共享特征梯度裁剪
+            
+
+            'value_coeff': 1,            
+            'entropy_coeff': 0.02,         # 增加熵权重促进探索
+            'device': 'cuda',
+            
+
+            'value_huber_loss': True,      # 使用Huber损失替代MSE
+            'value_huber_delta': 1.0,      # Huber损失的delta参数
+            
+            'ckpt_save_interval': 300,
+            'ckpt_save_path': model_dir,  
+            'save_every_n_iterations': 1200,  
+            'save_state_dict_every': 3000,
+            'log_dir': log_dir,  
+            'training_dir': current_training_dir,  
+            'timestamp': timestamp,  
+
+            'max_learner_iterations': 10000000,  
+            
+            'batch_norm': True,
+            'advantage_norm': True,
+            
+            # LSTM相关配置
+            'lstm_hidden_size': 256,
+            'lstm_layers': 2,
+            'dropout': 0.1,
+            'weight_decay': 5e-4,        
+        }
 
     print(f"Training configuration:")
     print(f"- Training directory: {config['training_dir']}")

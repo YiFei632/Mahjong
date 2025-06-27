@@ -195,6 +195,8 @@ class Actor(Process):
                     # interact with env
                     try:
                         next_obs, rewards, done = env.step(actions)
+                        if rewards:
+                            rewards = {name: reward * 0.1 for name, reward in rewards.items()}
                         
                         # 检查环境返回是否有效
                         if next_obs is None:
